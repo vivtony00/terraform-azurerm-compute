@@ -1,3 +1,5 @@
+# Fork from https://github.com/Azure/terraform-azurerm-compute
+
 module "os" {
   source       = "./os"
   vm_os_simple = var.vm_os_simple
@@ -19,6 +21,56 @@ resource "random_id" "vm-sa" {
   byte_length = 6
 }
 
+
+
+resource "azurerm_network_interface" "vm"{
+  name                = "${var.vm_hostname}-nic"
+  resource_group_name = data.azurerm_resource_group.vm.name
+  location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
+  enable_accelerated_networking = var.enable_accelerated_networking
+
+  ip_configuration {
+    name                          = "ipconfig-0"
+    subnet_id                     = var.vnet_subnet_id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = length(azurerm_public_ip.vm.*.id) > 0 ? element(concat(azurerm_public_ip.vm.*.id, tolist([""])) , 0) : ""
+  }
+  tags = var.tags
+}
+
+resource "azurerm_public_ip" "vm" {
+  resource_group_name = data.azurerm_resource_group.vm.name
+  location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
+
+  name              = "${var.vm_hostname}-publicIP"
+  allocation_method = "Dynamic"
+
+  domain_name_label = null
+}
+
+// Dynamic public ip address will be got after it's assigned to a vm
+data "azurerm_public_ip" "vm" {
+  name                = "${azurerm_public_ip.vm.name}"
+  resource_group_name = data.azurerm_resource_group.vm.name
+  depends_on          = [azurerm_linux_virtual_machine.vm]
+}
+# TODO azurerm_network_interface_security_group_association
+
+# resource "azurerm_network_interface_security_group_association" "nic_sg" {
+#   depends_on = [azurerm_network_interface.vm]
+#   for_each   = local.instances_data_with_sg
+
+#   network_interface_id      = azurerm_network_interface.vm[each.key].id
+#   network_security_group_id = lookup(each.value, "vpc_security_group_ids", null)
+# }
+
+# resource "azurerm_network_interface_application_security_group_association" "vm" {
+#   for_each = var.asg_id_map
+
+#   network_interface_id          = azurerm_network_interface.vm[each.key].id
+#   application_security_group_id = each.value
+# }
+
 resource "azurerm_storage_account" "vm-sa" {
   count                    = var.boot_diagnostics ? 1 : 0
   name                     = "bootdiag${lower(random_id.vm-sa.hex)}"
@@ -29,125 +81,15 @@ resource "azurerm_storage_account" "vm-sa" {
   tags                     = var.tags
 }
 
-resource "azurerm_virtual_machine" "vm-linux" {
-  count                            = ! contains(tolist([var.vm_os_simple, var.vm_os_offer]), "WindowsServer") && ! var.is_windows_image ? var.nb_instances : 0
-  name                             = "${var.vm_hostname}-vmLinux-${count.index}"
-  resource_group_name              = data.azurerm_resource_group.vm.name
-  location                         = coalesce(var.location, data.azurerm_resource_group.vm.location)
-  availability_set_id              = azurerm_availability_set.vm.id
-  vm_size                          = var.vm_size
-  network_interface_ids            = [element(azurerm_network_interface.vm.*.id, count.index)]
-  delete_os_disk_on_termination    = var.delete_os_disk_on_termination
-  delete_data_disks_on_termination = var.delete_data_disks_on_termination
 
-  dynamic identity {
-    for_each = length(var.identity_ids) == 0 && var.identity_type == "SystemAssigned" ? [var.identity_type] : []
-    content {
-      type = var.identity_type
-    }
-  }
-
-  dynamic identity {
-    for_each = length(var.identity_ids) > 0 || var.identity_type == "UserAssigned" ? [var.identity_type] : []
-    content {
-      type         = var.identity_type
-      identity_ids = length(var.identity_ids) > 0 ? var.identity_ids : []
-    }
-  }
-
-  storage_image_reference {
-    id        = var.vm_os_id
-    publisher = var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""
-    offer     = var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""
-    sku       = var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""
-    version   = var.vm_os_id == "" ? var.vm_os_version : ""
-  }
-
-  storage_os_disk {
-    name              = "osdisk-${var.vm_hostname}-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = var.storage_account_type
-  }
-
-  dynamic storage_data_disk {
-    for_each = range(var.nb_data_disk)
-    content {
-      name              = "${var.vm_hostname}-datadisk-${count.index}-${storage_data_disk.value}"
-      create_option     = "Empty"
-      lun               = storage_data_disk.value
-      disk_size_gb      = var.data_disk_size_gb
-      managed_disk_type = var.data_sa_type
-    }
-  }
-
-  dynamic storage_data_disk {
-    for_each = var.extra_disks
-    content {
-      name              = "${var.vm_hostname}-extradisk-${count.index}-${storage_data_disk.value.name}"
-      create_option     = "Empty"
-      lun               = storage_data_disk.key + var.nb_data_disk
-      disk_size_gb      = storage_data_disk.value.size
-      managed_disk_type = var.data_sa_type
-    }
-  }
-
-  os_profile {
-    computer_name  = "${var.vm_hostname}-${count.index}"
-    admin_username = var.admin_username
-    admin_password = var.admin_password
-    custom_data    = var.custom_data
-  }
-
-  os_profile_linux_config {
-    disable_password_authentication = var.enable_ssh_key
-
-    dynamic ssh_keys {
-      for_each = var.enable_ssh_key ? local.ssh_keys : []
-      content {
-        path     = "/home/${var.admin_username}/.ssh/authorized_keys"
-        key_data = file(ssh_keys.value)
-      }
-    }
-
-    dynamic ssh_keys {
-      for_each = var.enable_ssh_key ? var.ssh_key_values : []
-      content {
-        path     = "/home/${var.admin_username}/.ssh/authorized_keys"
-        key_data = ssh_keys.value
-      }
-    }
-
-  }
-
-  dynamic "os_profile_secrets" {
-    for_each = var.os_profile_secrets
-    content {
-      source_vault_id = os_profile_secrets.value["source_vault_id"]
-
-      vault_certificates {
-        certificate_url = os_profile_secrets.value["certificate_url"]
-      }
-    }
-  }
-
-  tags = var.tags
-
-  boot_diagnostics {
-    enabled     = var.boot_diagnostics
-    storage_uri = var.boot_diagnostics ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : ""
-  }
-}
-
-resource "azurerm_virtual_machine" "vm-windows" {
-  count                         = (var.is_windows_image || contains(tolist([var.vm_os_simple, var.vm_os_offer]), "WindowsServer")) ? var.nb_instances : 0
-  name                          = "${var.vm_hostname}-vmWindows-${count.index}"
-  resource_group_name           = data.azurerm_resource_group.vm.name
-  location                      = coalesce(var.location, data.azurerm_resource_group.vm.location)
-  availability_set_id           = azurerm_availability_set.vm.id
-  vm_size                       = var.vm_size
-  network_interface_ids         = [element(azurerm_network_interface.vm.*.id, count.index)]
-  delete_os_disk_on_termination = var.delete_os_disk_on_termination
+resource "azurerm_linux_virtual_machine" "vm" {
+  name                = var.vm_hostname
+  resource_group_name = data.azurerm_resource_group.vm.name
+  location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
+  availability_set_id = var.availability_set_id
+  size                = var.instance_type
+  admin_username      = var.admin_username
+  network_interface_ids = azurerm_network_interface.vm.*.id
   license_type                  = var.license_type
 
   dynamic identity {
@@ -165,145 +107,247 @@ resource "azurerm_virtual_machine" "vm-windows" {
     }
   }
 
-  storage_image_reference {
-    id        = var.vm_os_id
-    publisher = var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""
-    offer     = var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""
-    sku       = var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""
-    version   = var.vm_os_id == "" ? var.vm_os_version : ""
-  }
-
-  storage_os_disk {
-    name              = "${var.vm_hostname}-osdisk-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = var.storage_account_type
-  }
-
-  dynamic storage_data_disk {
-    for_each = range(var.nb_data_disk)
+  dynamic admin_ssh_key {
+    for_each = var.enable_ssh_key ? local.ssh_keys : []
     content {
-      name              = "${var.vm_hostname}-datadisk-${count.index}-${storage_data_disk.value}"
-      create_option     = "Empty"
-      lun               = storage_data_disk.value
-      disk_size_gb      = var.data_disk_size_gb
-      managed_disk_type = var.data_sa_type
+      username = var.admin_username
+      public_key = file(admin_ssh_key.value)
     }
   }
 
-  dynamic storage_data_disk {
-    for_each = var.extra_disks
+  dynamic admin_ssh_key {
+    for_each = var.enable_ssh_key ? var.ssh_key_values : []
     content {
-      name              = "${var.vm_hostname}-extradisk-${count.index}-${storage_data_disk.value.name}"
-      create_option     = "Empty"
-      lun               = storage_data_disk.key + var.nb_data_disk
-      disk_size_gb      = storage_data_disk.value.size
-      managed_disk_type = var.data_sa_type
+      username = var.admin_username
+      public_key = admin_ssh_key.value
     }
   }
 
-  os_profile {
-    computer_name  = "${var.vm_hostname}-${count.index}"
-    admin_username = var.admin_username
-    admin_password = var.admin_password
+  os_disk {
+    name                 = "osdisk-${var.vm_hostname}"
+    caching              = "ReadWrite"
+    # diff_disk_settings = TODO
+    # disk_encryption_set_id = TODO
+    storage_account_type = var.storage_account_type
+    disk_size_gb         = var.os_disk_size_gb
+    # write_accelerator_enabled = TODO
+  }
+  
+  source_image_reference {
+    publisher = coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher, "")
+    offer     = coalesce(var.vm_os_offer, module.os.calculated_value_os_offer, "")
+    sku       = coalesce(var.vm_os_sku, module.os.calculated_value_os_sku, "")
+    version   = coalesce(var.vm_os_version, "")
   }
 
-  tags = var.tags
-
-  os_profile_windows_config {
-    provision_vm_agent = true
-  }
-
-  dynamic "os_profile_secrets" {
-    for_each = var.os_profile_secrets
+  dynamic identity {
+    for_each = length(var.identity_ids) == 0 && var.identity_type == "SystemAssigned" ? [var.identity_type] : []
     content {
-      source_vault_id = os_profile_secrets.value["source_vault_id"]
-
-      vault_certificates {
-        certificate_url   = os_profile_secrets.value["certificate_url"]
-        certificate_store = os_profile_secrets.value["certificate_store"]
-      }
+      type = var.identity_type
     }
   }
 
-  boot_diagnostics {
-    enabled     = var.boot_diagnostics
-    storage_uri = var.boot_diagnostics ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : ""
+  dynamic identity {
+    for_each = length(var.identity_ids) > 0 || var.identity_type == "UserAssigned" ? [var.identity_type] : []
+    content {
+      type         = var.identity_type
+      identity_ids = length(var.identity_ids) > 0 ? var.identity_ids : []
+    }
   }
-}
 
-resource "azurerm_availability_set" "vm" {
-  name                         = "${var.vm_hostname}-avset"
-  resource_group_name          = data.azurerm_resource_group.vm.name
-  location                     = coalesce(var.location, data.azurerm_resource_group.vm.location)
-  platform_fault_domain_count  = 2
-  platform_update_domain_count = 2
-  managed                      = true
-  tags                         = var.tags
-}
-
-resource "azurerm_public_ip" "vm" {
-  count               = var.nb_public_ip
-  name                = "${var.vm_hostname}-pip-${count.index}"
-  resource_group_name = data.azurerm_resource_group.vm.name
-  location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
-  allocation_method   = var.allocation_method
-  sku                 = var.public_ip_sku
-  domain_name_label   = element(var.public_ip_dns, count.index)
-  tags                = var.tags
-}
-
-// Dynamic public ip address will be got after it's assigned to a vm
-data "azurerm_public_ip" "vm" {
-  count               = var.nb_public_ip
-  name                = azurerm_public_ip.vm[count.index].name
-  resource_group_name = data.azurerm_resource_group.vm.name
-  depends_on          = [azurerm_virtual_machine.vm-linux, azurerm_virtual_machine.vm-windows]
-}
-
-resource "azurerm_network_security_group" "vm" {
-  name                = "${var.vm_hostname}-nsg"
-  resource_group_name = data.azurerm_resource_group.vm.name
-  location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
-
-  tags = var.tags
-}
-
-resource "azurerm_network_security_rule" "vm" {
-  count                       = var.remote_port != "" ? 1 : 0
-  name                        = "allow_remote_${coalesce(var.remote_port, module.os.calculated_remote_port)}_in_all"
-  resource_group_name         = data.azurerm_resource_group.vm.name
-  description                 = "Allow remote protocol in from all locations"
-  priority                    = 101
-  direction                   = "Inbound"
-  access                      = "Allow"
-  protocol                    = "Tcp"
-  source_port_range           = "*"
-  destination_port_range      = coalesce(var.remote_port, module.os.calculated_remote_port)
-  source_address_prefixes     = var.source_address_prefixes
-  destination_address_prefix  = "*"
-  network_security_group_name = azurerm_network_security_group.vm.name
-}
-
-resource "azurerm_network_interface" "vm" {
-  count                         = var.nb_instances
-  name                          = "${var.vm_hostname}-nic-${count.index}"
-  resource_group_name           = data.azurerm_resource_group.vm.name
-  location                      = coalesce(var.location, data.azurerm_resource_group.vm.location)
-  enable_accelerated_networking = var.enable_accelerated_networking
-
-  ip_configuration {
-    name                          = "${var.vm_hostname}-ip-${count.index}"
-    subnet_id                     = var.vnet_subnet_id
-    private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = length(azurerm_public_ip.vm.*.id) > 0 ? element(concat(azurerm_public_ip.vm.*.id, tolist([""])), count.index) : ""
+  dynamic boot_diagnostics {
+    for_each = var.boot_diagnostics? [1] : []
+    content {
+      storage_account_uri = var.boot_diagnostics ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : ""
+    }
   }
 
   tags = var.tags
+  depends_on = [azurerm_network_interface.vm]
 }
 
-resource "azurerm_network_interface_security_group_association" "test" {
-  count                     = var.nb_instances
-  network_interface_id      = azurerm_network_interface.vm[count.index].id
-  network_security_group_id = azurerm_network_security_group.vm.id
-}
+# resource "azurerm_virtual_machine" "vm-linux" {
+#   count                            = ! contains(tolist([var.vm_os_simple, var.vm_os_offer]), "WindowsServer") && ! var.is_windows_image ? var.nb_instances : 0
+#   name                             = "${var.vm_hostname}-vmLinux-${count.index}"
+#   resource_group_name              = data.azurerm_resource_group.vm.name
+#   location                         = coalesce(var.location, data.azurerm_resource_group.vm.location)
+#   availability_set_id              = azurerm_availability_set.vm.id
+#   vm_size                          = var.vm_size
+#   network_interface_ids            = [element(azurerm_network_interface.vm.*.id, count.index)]
+#   delete_os_disk_on_termination    = var.delete_os_disk_on_termination
+#   delete_data_disks_on_termination = var.delete_data_disks_on_termination
+
+#   dynamic identity {
+#     for_each = length(var.identity_ids) == 0 && var.identity_type == "SystemAssigned" ? [var.identity_type] : []
+#     content {
+#       type = var.identity_type
+#     }
+#   }
+
+#   dynamic identity {
+#     for_each = length(var.identity_ids) > 0 || var.identity_type == "UserAssigned" ? [var.identity_type] : []
+#     content {
+#       type         = var.identity_type
+#       identity_ids = length(var.identity_ids) > 0 ? var.identity_ids : []
+#     }
+#   }
+
+#   storage_image_reference {
+#     id        = var.vm_os_id
+#     publisher = var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""
+#     offer     = var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""
+#     sku       = var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""
+#     version   = var.vm_os_id == "" ? var.vm_os_version : ""
+#   }
+
+#   storage_os_disk {
+#     name              = "osdisk-${var.vm_hostname}-${count.index}"
+#     create_option     = "FromImage"
+#     caching           = "ReadWrite"
+#     managed_disk_type = var.storage_account_type
+#   }
+
+#   dynamic storage_data_disk {
+#     for_each = range(var.nb_data_disk)
+#     content {
+#       name              = "${var.vm_hostname}-datadisk-${count.index}-${storage_data_disk.value}"
+#       create_option     = "Empty"
+#       lun               = storage_data_disk.value
+#       disk_size_gb      = var.data_disk_size_gb
+#       managed_disk_type = var.data_sa_type
+#     }
+#   }
+
+#   dynamic storage_data_disk {
+#     for_each = var.extra_disks
+#     content {
+#       name              = "${var.vm_hostname}-extradisk-${count.index}-${storage_data_disk.value.name}"
+#       create_option     = "Empty"
+#       lun               = storage_data_disk.key + var.nb_data_disk
+#       disk_size_gb      = storage_data_disk.value.size
+#       managed_disk_type = var.data_sa_type
+#     }
+#   }
+
+#   os_profile {
+#     computer_name  = "${var.vm_hostname}-${count.index}"
+#     admin_username = var.admin_username
+#     admin_password = var.admin_password
+#     custom_data    = var.custom_data
+#   }
+
+#   os_profile_linux_config {
+#     disable_password_authentication = var.enable_ssh_key
+
+#     dynamic ssh_keys {
+#       for_each = var.enable_ssh_key ? local.ssh_keys : []
+#       content {
+#         path     = "/home/${var.admin_username}/.ssh/authorized_keys"
+#         key_data = file(ssh_keys.value)
+#       }
+#     }
+
+#     dynamic ssh_keys {
+#       for_each = var.enable_ssh_key ? var.ssh_key_values : []
+#       content {
+#         path     = "/home/${var.admin_username}/.ssh/authorized_keys"
+#         key_data = ssh_keys.value
+#       }
+#     }
+
+#   }
+
+#   dynamic "os_profile_secrets" {
+#     for_each = var.os_profile_secrets
+#     content {
+#       source_vault_id = os_profile_secrets.value["source_vault_id"]
+
+#       vault_certificates {
+#         certificate_url = os_profile_secrets.value["certificate_url"]
+#       }
+#     }
+#   }
+
+#   tags = var.tags
+
+#   boot_diagnostics {
+#     enabled     = var.boot_diagnostics
+#     storage_uri = var.boot_diagnostics ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : ""
+#   }
+# }
+
+# resource "azurerm_availability_set" "vm" {
+#   name                         = "${var.vm_hostname}-avset"
+#   resource_group_name          = data.azurerm_resource_group.vm.name
+#   location                     = coalesce(var.location, data.azurerm_resource_group.vm.location)
+#   platform_fault_domain_count  = 2
+#   platform_update_domain_count = 2
+#   managed                      = true
+#   tags                         = var.tags
+# }
+
+# resource "azurerm_public_ip" "vm" {
+#   count               = var.nb_public_ip
+#   name                = "${var.vm_hostname}-pip-${count.index}"
+#   resource_group_name = data.azurerm_resource_group.vm.name
+#   location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
+#   allocation_method   = var.allocation_method
+#   sku                 = var.public_ip_sku
+#   domain_name_label   = element(var.public_ip_dns, count.index)
+#   tags                = var.tags
+# }
+
+# // Dynamic public ip address will be got after it's assigned to a vm
+# data "azurerm_public_ip" "vm" {
+#   count               = var.nb_public_ip
+#   name                = azurerm_public_ip.vm[count.index].name
+#   resource_group_name = data.azurerm_resource_group.vm.name
+#   depends_on          = [azurerm_virtual_machine.vm-linux, azurerm_virtual_machine.vm-windows]
+# }
+
+# resource "azurerm_network_security_group" "vm" {
+#   name                = "${var.vm_hostname}-nsg"
+#   resource_group_name = data.azurerm_resource_group.vm.name
+#   location            = coalesce(var.location, data.azurerm_resource_group.vm.location)
+
+#   tags = var.tags
+# }
+
+# resource "azurerm_network_security_rule" "vm" {
+#   count                       = var.remote_port != "" ? 1 : 0
+#   name                        = "allow_remote_${coalesce(var.remote_port, module.os.calculated_remote_port)}_in_all"
+#   resource_group_name         = data.azurerm_resource_group.vm.name
+#   description                 = "Allow remote protocol in from all locations"
+#   priority                    = 101
+#   direction                   = "Inbound"
+#   access                      = "Allow"
+#   protocol                    = "Tcp"
+#   source_port_range           = "*"
+#   destination_port_range      = coalesce(var.remote_port, module.os.calculated_remote_port)
+#   source_address_prefixes     = var.source_address_prefixes
+#   destination_address_prefix  = "*"
+#   network_security_group_name = azurerm_network_security_group.vm.name
+# }
+
+# resource "azurerm_network_interface" "vm" {
+#   count                         = var.nb_instances
+#   name                          = "${var.vm_hostname}-nic-${count.index}"
+#   resource_group_name           = data.azurerm_resource_group.vm.name
+#   location                      = coalesce(var.location, data.azurerm_resource_group.vm.location)
+#   enable_accelerated_networking = var.enable_accelerated_networking
+
+#   ip_configuration {
+#     name                          = "${var.vm_hostname}-ip-${count.index}"
+#     subnet_id                     = var.vnet_subnet_id
+#     private_ip_address_allocation = "Dynamic"
+#     public_ip_address_id          = length(azurerm_public_ip.vm.*.id) > 0 ? element(concat(azurerm_public_ip.vm.*.id, tolist([""])), count.index) : ""
+#   }
+
+#   tags = var.tags
+# }
+
+# resource "azurerm_network_interface_security_group_association" "test" {
+#   count                     = var.nb_instances
+#   network_interface_id      = azurerm_network_interface.vm[count.index].id
+#   network_security_group_id = azurerm_network_security_group.vm.id
+# }

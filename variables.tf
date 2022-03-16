@@ -67,7 +67,7 @@ variable "storage_account_type" {
   default     = "Premium_LRS"
 }
 
-variable "vm_size" {
+variable "instance_type" {
   description = "Specifies the size of the virtual machine."
   type        = string
   default     = "Standard_D2s_v3"
@@ -89,18 +89,6 @@ variable "vm_os_simple" {
   description = "Specify UbuntuServer, WindowsServer, RHEL, openSUSE-Leap, CentOS, Debian, CoreOS and SLES to get the latest image version of the specified os.  Do not provide this value if a custom value is used for vm_os_publisher, vm_os_offer, and vm_os_sku."
   type        = string
   default     = ""
-}
-
-variable "vm_os_id" {
-  description = "The resource ID of the image that you want to deploy if you are using a custom image.Note, need to provide is_windows_image = true for windows custom images."
-  type        = string
-  default     = ""
-}
-
-variable "is_windows_image" {
-  description = "Boolean flag to notify when the custom image is windows based."
-  type        = bool
-  default     = false
 }
 
 variable "vm_os_publisher" {
@@ -152,30 +140,6 @@ variable "nb_public_ip" {
   description = "Number of public IPs to assign corresponding to one IP per vm. Set to 0 to not assign any public IP addresses."
   type        = number
   default     = 1
-}
-
-variable "delete_os_disk_on_termination" {
-  type        = bool
-  description = "Delete datadisk when machine is terminated."
-  default     = false
-}
-
-variable "delete_data_disks_on_termination" {
-  type        = bool
-  description = "Delete data disks when machine is terminated."
-  default     = false
-}
-
-variable "data_sa_type" {
-  description = "Data Disk Storage Account type."
-  type        = string
-  default     = "Standard_LRS"
-}
-
-variable "data_disk_size_gb" {
-  description = "Storage data disk size size."
-  type        = number
-  default     = 30
 }
 
 variable "boot_diagnostics" {
@@ -245,4 +209,16 @@ variable "os_profile_secrets" {
   description = "Specifies a list of certificates to be installed on the VM, each list item is a map with the keys source_vault_id, certificate_url and certificate_store."
   type        = list(map(string))
   default     = []
+}
+
+variable "os_disk_size_gb" {
+  description = "The Size of the Internal OS Disk in GB, if you wish to vary from the size used in the image this Virtual Machine is sourced from."
+  type        = number
+  default     = 30
+}
+
+variable "availability_set_id" {
+  description = "Specifies a availability_set id to be assigned to the VM."
+  type        = string
+
 }
